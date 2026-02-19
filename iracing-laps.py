@@ -16,7 +16,6 @@ Requirements:
 import argparse
 import csv
 import datetime
-import json
 import os
 import re
 import sys
@@ -44,6 +43,9 @@ class LapData:
     lap_time: Optional[float]   # None if the lap is incomplete
     offtracks: int = 0
     on_pit_road: bool = False   # True if the lap was driven through the pit lane
+    sector_times: list = field(default_factory=list)  # [float|None, ...] one per sector; empty if no split data
+    # Internal: maps sector boundary index → LapCurrentLapTime at crossing; cleared after lap closes
+    _sector_cross: dict = field(default_factory=dict, repr=False, compare=False)
 
     def lap_time_str(self) -> str:
         if self.lap_time is None or self.lap_time <= 0:
@@ -77,6 +79,61 @@ class SessionData:
 
     def total_offtracks(self) -> int:
         return sum(l.offtracks for l in self.laps)
+
+
+# ──────────────────────────────────────────────
+# Sector time helpers
+# ──────────────────────────────────────────────
+
+def _compute_sector_times(lap: 'LapData', sector_boundaries: list) -> None:
+    """
+    Converts the raw crossing-time dict on `lap._sector_cross` into
+    `lap.sector_times` (list of floats or None, one per sector).
+
+    sector_boundaries: sorted list of LapDistPct fractions from SplitTimeInfo,
+        e.g. [0.0, 0.14, 0.33, 0.88]  (boundaries[0] == 0.0 == S/F line)
+    _sector_cross: {boundary_index: LapCurrentLapTime at crossing}
+        Key  1 → time when car crossed boundaries[1]  (start of sector 2)
+        Key  2 → time when car crossed boundaries[2]  (start of sector 3)
+        ...
+        (boundary_index 0 is the S/F line and is never stored — lap starts at t=0)
+
+    Number of sectors = len(sector_boundaries).
+    Sector k (0-based) runs from boundaries[k] to boundaries[k+1] for k < last,
+    and from boundaries[-1] to S/F line for the last sector.
+
+    Sector durations:
+        sector 0  = _sector_cross[1]                         (0 → split 1)
+        sector k  = _sector_cross[k+1] - _sector_cross[k]   (split k → split k+1)
+        last      = lap.lap_time - _sector_cross[last_idx]   (last split → finish)
+    """
+    num_sectors = len(sector_boundaries)  # e.g. 4 boundaries → 4 sectors
+    times = []
+    cross = lap._sector_cross
+
+    for k in range(num_sectors):
+        if k == 0:
+            # Sector 0: from lap start (t=0) to first split crossing
+            t = cross.get(1)
+            times.append(round(t, 3) if t is not None else None)
+        elif k == num_sectors - 1:
+            # Last sector: from last split crossing to lap finish
+            t_start = cross.get(k)
+            if t_start is not None and lap.lap_time and lap.lap_time > 0:
+                times.append(round(lap.lap_time - t_start, 3))
+            else:
+                times.append(None)
+        else:
+            # Middle sectors: difference between consecutive split crossings
+            t_end   = cross.get(k + 1)
+            t_start = cross.get(k)
+            if t_end is not None and t_start is not None:
+                times.append(round(t_end - t_start, 3))
+            else:
+                times.append(None)
+
+    lap.sector_times = times
+    lap._sector_cross.clear()
 
 
 # ──────────────────────────────────────────────
@@ -130,10 +187,23 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
 
         sessions     = session_info.get('SessionInfo', {}).get('Sessions', [{}])
         session_type = sessions[0].get('SessionType', 'UNKNOWN').upper() if sessions else 'UNKNOWN'
+
+        # Sector split boundaries from SplitTimeInfo (0.0–1.0 as LapDistPct fractions)
+        split_info = session_info.get('SplitTimeInfo', {})
+        sectors_raw = split_info.get('Sectors', [])
+        # Collect all SectorStartPct values, sorted by SectorNum
+        sector_boundaries = sorted(
+            float(s['SectorStartPct']) for s in sectors_raw if 'SectorStartPct' in s
+        )
+        # boundaries[0] == 0.0 (S/F line), boundaries[1..n] == split lines
+        # Number of actual sectors = len(boundaries) - 1  (need at least 2 to have 1 sector split)
+        if len(sector_boundaries) < 2:
+            sector_boundaries = []   # no split data for this track
     except Exception:
-        track_name   = 'Unknown'
-        car_name     = 'Unknown'
-        session_type = 'UNKNOWN'
+        track_name       = 'Unknown'
+        car_name         = 'Unknown'
+        session_type     = 'UNKNOWN'
+        sector_boundaries = []
 
     # Date from DiskSubHeader timestamp (more reliable than the YAML field)
     try:
@@ -152,11 +222,13 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
     #   0=NotInWorld, 1=OffTrack, 2=InPitStall, 3=ApproachingPits, 4=OnTrack
     # CarLeftTrack may not be present in all .ibt files.
     try:
-        laps_arr      = ir.get_all('Lap')                  # list[int]
-        lap_times_arr = ir.get_all('LapLastLapTime')       # list[float]
-        surface_arr   = ir.get_all('PlayerTrackSurface')   # list[int], 1=OffTrack
-        pit_arr       = ir.get_all('OnPitRoad')            # list[bool]
-        n             = ir._disk_header.session_record_count
+        laps_arr         = ir.get_all('Lap')                  # list[int]
+        lap_times_arr    = ir.get_all('LapLastLapTime')       # list[float]
+        surface_arr      = ir.get_all('PlayerTrackSurface')   # list[int], 1=OffTrack
+        pit_arr          = ir.get_all('OnPitRoad')            # list[bool]
+        dist_pct_arr     = ir.get_all('LapDistPct')           # list[float], 0.0–1.0 around the lap
+        cur_lap_time_arr = ir.get_all('LapCurrentLapTime')    # list[float], elapsed time in current lap
+        n                = ir._disk_header.session_record_count
     except Exception as e:
         print(f"  [ERROR] Could not read channels from {os.path.basename(filepath)}: {e}")
         ir.close()
@@ -167,8 +239,9 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
         return None
 
     laps: dict[int, LapData] = {}
-    prev_lap_num  = -1
-    prev_offtrack = False   # used to detect rising edge (entered off-track zone)
+    prev_lap_num   = -1
+    prev_offtrack  = False   # used to detect rising edge (entered off-track zone)
+    prev_dist_pct: dict[int, float] = {}  # lap_num → last LapDistPct, for sector crossing detection
 
     for i in range(n):
         try:
@@ -176,6 +249,8 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
             lap_last_time = float(lap_times_arr[i] or -1.0)
             is_offtrack   = int(surface_arr[i] or 0) == 1  # iRSurfaceType::OffTrack
             on_pit_road   = bool(pit_arr[i] if pit_arr else False)
+            dist_pct      = float(dist_pct_arr[i] or 0.0)     if dist_pct_arr     else 0.0
+            cur_lap_time  = float(cur_lap_time_arr[i] or 0.0) if cur_lap_time_arr else 0.0
         except Exception:
             continue
 
@@ -195,10 +270,26 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
             prev_lap = laps.get(prev_lap_num)
             if prev_lap and lap_last_time > 0:
                 prev_lap.lap_time = lap_last_time
+                # Compute sector times for the completed lap using boundary crossing data
+                if sector_boundaries and prev_lap._sector_cross:
+                    _compute_sector_times(prev_lap, sector_boundaries)
 
         # Count off-track events on rising edge (car just entered an off-track zone)
         if is_offtrack and not prev_offtrack:
             current_lap.offtracks += 1
+
+        # Detect sector boundary crossings (rising edge on each split line)
+        if sector_boundaries and cur_lap_time > 0:
+            prev_d = prev_dist_pct.get(lap_num, 0.0)
+            for si, boundary in enumerate(sector_boundaries):
+                if si == 0:
+                    continue  # skip S/F line (sector 0 start = lap start)
+                # Rising-edge crossing: were behind this boundary, now at or past it
+                if prev_d < boundary <= dist_pct:
+                    # Only record the first crossing per sector boundary per lap
+                    if si not in current_lap._sector_cross:
+                        current_lap._sector_cross[si] = cur_lap_time
+            prev_dist_pct[lap_num] = dist_pct
 
         prev_lap_num  = lap_num
         prev_offtrack = is_offtrack
@@ -226,32 +317,71 @@ def parse_ibt(filepath: str) -> Optional[SessionData]:
 
 
 # ──────────────────────────────────────────────
-# Processed-file registry
+# Deduplication helper
 # ──────────────────────────────────────────────
 
-REGISTRY_FILE = 'processed.json'
-
-def load_registry(output_dir: Path) -> set:
-    """Returns the set of .ibt filenames that have already been processed."""
-    registry_path = output_dir / REGISTRY_FILE
-    if registry_path.exists():
-        try:
-            with open(registry_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return set(data.get('processed', []))
-        except Exception:
-            pass
-    return set()
-
-
-def save_registry(output_dir: Path, processed: set) -> None:
-    """Saves the set of processed filenames to the JSON registry."""
-    registry_path = output_dir / REGISTRY_FILE
+def _read_existing_dates(fpath: Path) -> set:
+    """
+    Returns the set of 'date' values already written in an existing CSV file.
+    Used by export_csv_split to skip sessions that were already exported.
+    Returns an empty set if the file doesn't exist or can't be read.
+    """
+    if not fpath.exists():
+        return set()
     try:
-        with open(registry_path, 'w', encoding='utf-8') as f:
-            json.dump({'processed': sorted(processed)}, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"  [WARNING] Could not save registry: {e}")
+        with open(fpath, encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            return {
+                row['date'] for row in reader
+                if 'date' in row and row.get('date', '').strip() not in ('', 'date')
+            }
+    except Exception:
+        return set()
+
+
+def _read_existing_sector_count(fpath: Path) -> int:
+    """
+    Returns the number of sector columns in an existing CSV file.
+    Reads the header row only. Returns 0 if the file doesn't exist or has no sectors.
+    """
+    if not fpath.exists():
+        return 0
+    try:
+        with open(fpath, encoding='utf-8', newline='') as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+        return sum(1 for col in header if col.startswith('sector'))
+    except Exception:
+        return 0
+
+
+def _rewrite_csv_with_more_sectors(fpath: Path, new_max_sectors: int) -> None:
+    """
+    Rewrites an existing CSV to add extra empty sector columns up to new_max_sectors.
+    Called when a new session has more sectors than the existing CSV.
+    """
+    try:
+        with open(fpath, encoding='utf-8', newline='') as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return
+        old_header = rows[0]
+        old_sectors = sum(1 for c in old_header if c.startswith('sector'))
+        if old_sectors >= new_max_sectors:
+            return  # nothing to do
+
+        new_header = CSV_HEADER_BASE + _sector_header(new_max_sectors)
+        extra = new_max_sectors - old_sectors
+        new_rows = [new_header]
+        for row in rows[1:]:
+            # Append empty strings for the additional sector columns
+            new_rows.append(row + [''] * extra)
+
+        with open(fpath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerows(new_rows)
+    except Exception:
+        pass  # leave the file as-is on any error
 
 
 # ──────────────────────────────────────────────
@@ -290,18 +420,44 @@ def print_session(session: SessionData, laps: list | None = None) -> None:
 # CSV export
 # ──────────────────────────────────────────────
 
-CSV_HEADER = [
+CSV_HEADER_BASE = [
     'date', 'car', 'track', 'session_type',
     'lap', 'lap_time', 'offtracks', 'in_pit'
 ]
+# Kept for backwards-compatibility when no sector data is present
+CSV_HEADER = CSV_HEADER_BASE
+
+
+def _sector_header(max_sectors: int) -> list:
+    """Returns sector column names: ['sector1', 'sector2', ...]"""
+    return [f'sector{i+1}' for i in range(max_sectors)]
+
+
+def _sector_vals(lap: 'LapData', max_sectors: int) -> list:
+    """Returns formatted sector time strings, padded to max_sectors with ''."""
+    vals = []
+    for t in lap.sector_times[:max_sectors]:
+        if t is None:
+            vals.append('')
+        else:
+            mins = int(t // 60)
+            secs = t % 60
+            vals.append(f"{mins}:{secs:06.3f}" if mins > 0 else f"{secs:.3f}s")
+    # Pad if fewer sectors recorded than max
+    vals += [''] * (max_sectors - len(vals))
+    return vals
 
 
 def export_csv(sessions: list[SessionData], output_path: str,
                laps_map: dict | None = None) -> None:
     """laps_map: {session.filename: [LapData, ...]} to pass filtered lap lists."""
+    all_laps = [l for s in sessions for l in (laps_map or {}).get(s.filename, s.laps)]
+    max_sectors = max((len(l.sector_times) for l in all_laps), default=0)
+    header = CSV_HEADER_BASE + _sector_header(max_sectors)
+
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(CSV_HEADER)
+        writer.writerow(header)
         for session in sessions:
             laps = (laps_map or {}).get(session.filename, session.laps)
             for rel, lap in enumerate(laps, 1):
@@ -314,6 +470,7 @@ def export_csv(sessions: list[SessionData], output_path: str,
                     lap.lap_time_str(),
                     lap.offtracks,
                     '1' if lap.on_pit_road else '0',
+                    *_sector_vals(lap, max_sectors),
                 ])
     print(f"\n✔ CSV exported: {output_path}")
 
@@ -337,7 +494,14 @@ def export_csv_split(sessions: list, output_dir: Path,
     """
     Writes one CSV per track+car combination into output_dir.
     Appends rows to an existing file without repeating the header.
-    Returns the list of files written.
+    Skips any session whose 'date' value is already present in the CSV
+    (deduplication: safe to call multiple times without creating duplicates).
+
+    If the new session has more sectors than the existing CSV, the CSV is
+    transparently rewritten to add the extra (empty) sector columns before
+    appending, so every row always has the same number of columns.
+
+    Returns the list of files written to.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     written_files = []
@@ -348,12 +512,28 @@ def export_csv_split(sessions: list, output_dir: Path,
             continue
 
         fpath = output_dir / csv_filename(session.track, session.car)
+
+        # Skip this session if it was already written (deduplication by date)
+        existing_dates = _read_existing_dates(fpath)
+        if session.date in existing_dates:
+            continue
+
+        session_sectors = max((len(l.sector_times) for l in laps), default=0)
+        existing_sectors = _read_existing_sector_count(fpath)
+        max_sectors = max(session_sectors, existing_sectors)
+
+        # If the CSV exists but has fewer sector columns than this session,
+        # rewrite it with extra empty columns so all rows stay aligned.
+        if fpath.exists() and session_sectors > existing_sectors:
+            _rewrite_csv_with_more_sectors(fpath, max_sectors)
+
         file_exists = fpath.exists()
+        header = CSV_HEADER_BASE + _sector_header(max_sectors)
 
         with open(fpath, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(CSV_HEADER)
+                writer.writerow(header)
             for rel, lap in enumerate(laps, 1):
                 writer.writerow([
                     session.date,
@@ -364,6 +544,7 @@ def export_csv_split(sessions: list, output_dir: Path,
                     lap.lap_time_str(),
                     lap.offtracks,
                     '1' if lap.on_pit_road else '0',
+                    *_sector_vals(lap, max_sectors),
                 ])
 
         if fpath not in written_files:
@@ -390,7 +571,7 @@ def main():
     parser.add_argument(
         '--output-dir', '-O',
         default=None,
-        help='Directory where CSVs and the registry are saved (default: same as --dir)'
+        help='Directory where CSVs are saved (default: same as --dir)'
     )
     parser.add_argument(
         '--csv', '-c',
@@ -407,11 +588,6 @@ def main():
         action='store_true',
         help='Only show/export laps with a recorded time (excludes INCOMPLETE laps)'
     )
-    parser.add_argument(
-        '--force', '-f',
-        action='store_true',
-        help='Re-process all .ibt files even if they are already in the registry'
-    )
     args = parser.parse_args()
 
     # Resolve directories
@@ -424,43 +600,23 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load registry of already-processed files
-    registry = load_registry(output_dir)
-    if registry and not args.force:
-        print(f"Registry loaded: {len(registry)} file(s) already processed previously.")
-
     # Find .ibt files
     pattern   = '**/*.ibt' if args.recursive else '*.ibt'
-    all_files = sorted(base.glob(pattern))
+    ibt_files = sorted(base.glob(pattern))
 
-    if not all_files:
+    if not ibt_files:
         print(f"No .ibt files found in: {base}")
         sys.exit(0)
 
-    # Skip already-processed files (unless --force)
-    if args.force:
-        ibt_files = all_files
-        print(f"--force mode: re-processing all {len(ibt_files)} file(s).")
-    else:
-        ibt_files = [f for f in all_files if f.name not in registry]
-        skipped   = len(all_files) - len(ibt_files)
-        if skipped:
-            print(f"Skipped {skipped} already-processed file(s). Use --force to re-process them.")
+    print(f"Processing {len(ibt_files)} file(s)…")
+    print("(Sessions already in a CSV are skipped automatically — delete the CSV to reprocess.)")
 
-    if not ibt_files:
-        print("No new files to process.")
-        sys.exit(0)
-
-    print(f"Processing {len(ibt_files)} new file(s)...")
-
-    sessions     = []
-    new_registry = set()
+    sessions = []
     for i, filepath in enumerate(ibt_files, 1):
         print(f"[{i}/{len(ibt_files)}] {filepath.name}...", end=' ', flush=True)
         session = parse_ibt(str(filepath))
         if session:
             sessions.append(session)
-            new_registry.add(filepath.name)
             print(f"OK ({len(session.laps)} laps)")
         else:
             print("SKIPPED (no valid data)")
@@ -501,11 +657,6 @@ def main():
     # Optional single CSV (for bulk import / compatibility)
     if args.csv:
         export_csv(sessions, args.csv, laps_map=laps_map)
-
-    # Update the registry with the files successfully processed this run
-    updated_registry = registry | new_registry
-    save_registry(output_dir, updated_registry)
-    print(f"\n✔ Registry updated: {len(updated_registry)} file(s) total.")
 
 
 if __name__ == '__main__':

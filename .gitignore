@@ -20,5 +20,8 @@ telemetry/
 output/
 resultados/
 
+# Track map images (user-managed, not versioned)
+trackmaps/
+
 # macOS
 .DS_Store

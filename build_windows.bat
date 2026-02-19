@@ -19,7 +19,7 @@ echo.
 
 :: Install dependencies
 echo [1/3] Installing dependencies...
-pip install pyirsdk pyyaml pyinstaller --quiet
+pip install pyirsdk pyyaml customtkinter matplotlib pyinstaller --quiet
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies. Check your internet connection and that Python is in PATH.
     pause
