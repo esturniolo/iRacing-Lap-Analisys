@@ -5,6 +5,9 @@ on:
     branches: [ main ]
     tags:
       - 'v*'          # also triggers on version tags like v1.0.0
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
   workflow_dispatch:  # allows manual trigger from the GitHub UI
 
 jobs:
