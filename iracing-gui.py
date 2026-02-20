@@ -3,7 +3,6 @@ iracing-gui.py
 --------------
 All-in-one GUI for iRacing lap telemetry:
   1. Processes .ibt files from a user-selected telemetry folder
-     (uses iracing-laps.py logic — must be in the same directory)
   2. Saves per-track/car CSVs to a user-selected output folder
      (default: ~/Documents/iRacing-Lap-Analysis)
   3. Supports loading individual .ibt files in-memory (no CSV written)
@@ -35,27 +34,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.ticker import FuncFormatter
 from tksheet import Sheet as TkSheet
-
-
-# ──────────────────────────────────────────────
-# iracing-laps.py importer
-# ──────────────────────────────────────────────
-
-def _import_iracing_laps():
-    """
-    Imports parse_ibt, export_csv_split, load_registry, save_registry
-    from iracing-laps.py (same directory as this script).
-    Returns the module, or None if not found.
-    """
-    import importlib.util
-    script_dir = Path(__file__).parent
-    laps_path  = script_dir / "iracing-laps.py"
-    if not laps_path.exists():
-        return None
-    spec   = importlib.util.spec_from_file_location("iracing_laps", laps_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+import iracing_laps
 
 
 # ──────────────────────────────────────────────
@@ -1191,14 +1170,6 @@ class App(ctk.CTk):
             messagebox.showerror("Not found", f"Folder not found:\n{ibt_dir}")
             return
 
-        laps_mod = _import_iracing_laps()
-        if laps_mod is None:
-            messagebox.showerror(
-                "iracing-laps.py not found",
-                "iracing-laps.py must be in the same folder as iracing-gui.py.",
-            )
-            return
-
         ibt_files = sorted(Path(ibt_dir).glob("*.ibt"))
         if not ibt_files:
             self._set_status("No .ibt files found in the selected folder.", color="#f07746")
@@ -1213,12 +1184,12 @@ class App(ctk.CTk):
 
         threading.Thread(
             target=self._process_worker,
-            args=(laps_mod, ibt_files, out_dir),
+            args=(ibt_files, out_dir),
             daemon=True,
         ).start()
         self.after(80, self._poll_queue)
 
-    def _process_worker(self, laps_mod, files, out_dir):
+    def _process_worker(self, files, out_dir):
         """Runs in background thread. Parses .ibt files and exports CSVs."""
         only_complete = self._only_complete.get()
         sessions      = []
@@ -1227,7 +1198,7 @@ class App(ctk.CTk):
         for idx, fpath in enumerate(files, 1):
             self._queue.put(("progress", idx, n, fpath.name))
             try:
-                session = laps_mod.parse_ibt(str(fpath))
+                session = iracing_laps.parse_ibt(str(fpath))
                 if session:
                     sessions.append(session)
             except Exception as e:
@@ -1241,7 +1212,7 @@ class App(ctk.CTk):
         laps_map = {s.filename: filter_laps(s.laps) for s in sessions}
 
         try:
-            laps_mod.export_csv_split(sessions, Path(out_dir), laps_map=laps_map)
+            iracing_laps.export_csv_split(sessions, Path(out_dir), laps_map=laps_map)
         except Exception as e:
             self._queue.put(("log", f"  CSV export error: {e}"))
 
@@ -1253,14 +1224,6 @@ class App(ctk.CTk):
 
     def _start_memory_processing(self, files: list, source: str):
         """Launches background processing of .ibt files in memory (no CSV export)."""
-        laps_mod = _import_iracing_laps()
-        if laps_mod is None:
-            messagebox.showerror(
-                "iracing-laps.py not found",
-                "iracing-laps.py must be in the same folder as iracing-gui.py.",
-            )
-            return
-
         self._processing = True
         self._process_btn.configure(state="disabled")
         self._progress.set(0)
@@ -1268,12 +1231,12 @@ class App(ctk.CTk):
 
         threading.Thread(
             target=self._process_worker_memory,
-            args=(laps_mod, files, source),
+            args=(files, source),
             daemon=True,
         ).start()
         self.after(80, self._poll_queue)
 
-    def _process_worker_memory(self, laps_mod, files, source: str):
+    def _process_worker_memory(self, files, source: str):
         """Background worker: parses .ibt files and sends parsed sessions via queue (no CSV)."""
         only_complete = self._only_complete.get()
         sessions      = []
@@ -1282,7 +1245,7 @@ class App(ctk.CTk):
         for idx, fpath in enumerate(files, 1):
             self._queue.put(("progress", idx, n, fpath.name))
             try:
-                parsed = laps_mod.parse_ibt(str(fpath))
+                parsed = iracing_laps.parse_ibt(str(fpath))
                 if parsed:
                     # Filter laps if needed
                     if only_complete:
