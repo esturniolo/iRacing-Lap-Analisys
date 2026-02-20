@@ -23,5 +23,8 @@ resultados/
 # Track map images (user-managed, not versioned)
 trackmaps/
 
+# Local settings
+settings.local.json
+
 # macOS
 .DS_Store

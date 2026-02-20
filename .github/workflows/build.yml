@@ -1,0 +1,68 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'          # also triggers on version tags like v1.0.0
+  workflow_dispatch:  # allows manual trigger from the GitHub UI
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyirsdk pyyaml customtkinter matplotlib tksheet pyinstaller
+
+      - name: Find CustomTkinter package path
+        id: ctk_path
+        run: |
+          $ctk = python -c "import customtkinter, os; print(os.path.dirname(customtkinter.__file__))"
+          echo "CTK_PATH=$ctk" >> $env:GITHUB_ENV
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "iRacing-Lap-Analyzer" `
+            --add-data "$env:CTK_PATH;customtkinter" `
+            --hidden-import customtkinter `
+            --hidden-import tksheet `
+            --hidden-import PIL `
+            --hidden-import matplotlib.backends.backend_tkagg `
+            iracing-gui.py
+
+      - name: Copy iracing-laps.py next to EXE
+        run: |
+          copy iracing-laps.py dist\iracing-laps.py
+
+      - name: Upload EXE as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iRacing-Lap-Analyzer-Windows
+          path: |
+            dist\iRacing-Lap-Analyzer.exe
+            dist\iracing-laps.py
+          retention-days: 30
+
+      # Only creates a GitHub Release when you push a version tag (v*)
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist\iRacing-Lap-Analyzer.exe
+            dist\iracing-laps.py
+          generate_release_notes: true
