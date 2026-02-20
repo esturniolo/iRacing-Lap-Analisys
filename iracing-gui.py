@@ -5,10 +5,13 @@ All-in-one GUI for iRacing lap telemetry:
   1. Processes .ibt files from a user-selected telemetry folder
      (uses iracing-laps.py logic — must be in the same directory)
   2. Saves per-track/car CSVs to a user-selected output folder
-  3. Visualises the resulting data (table + 4 chart types)
+     (default: ~/Documents/iRacing-Lap-Analysis)
+  3. Supports loading individual .ibt files in-memory (no CSV written)
+  4. Supports loading external .ibt folders (friends/team) in-memory
+  5. Visualises the resulting data (table + charts)
 
 Requirements:
-    pip install customtkinter matplotlib
+    pip install customtkinter matplotlib tksheet
 """
 
 # matplotlib backend MUST be set before any pyplot import
@@ -31,12 +34,7 @@ import customtkinter as ctk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.ticker import FuncFormatter
-
-try:
-    from PIL import Image, ImageTk
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
+from tksheet import Sheet as TkSheet
 
 
 # ──────────────────────────────────────────────
@@ -76,7 +74,7 @@ class LapRow:
 
 @dataclass
 class SessionData:
-    csv_file: str           # source CSV basename
+    csv_file: str           # source CSV basename (or IBT filename for in-memory sessions)
     date: str               # "YYYY-MM-DD HH:MM"
     car: str
     track: str
@@ -86,6 +84,7 @@ class SessionData:
     best_lap_idx: Optional[int] = None              # index into self.laps
     clean_laps: list = field(default_factory=list)  # list[LapRow], no pit / no outliers
     avg_clean_sec: Optional[float] = None
+    source: str = "own"     # "own" = CSV on disk | "memory" = own IBT in-memory | "external" = friend/team IBT
 
     def label(self) -> str:
         # Keep date+time, truncate track and car so they fit in the ~220 px listbox
@@ -94,7 +93,8 @@ class SessionData:
         track_s    = (self.track[:24] + "…") if len(self.track) > 25 else self.track
         car_s      = (self.car[:19] + "…")   if len(self.car)   > 20 else self.car
         stype      = self.session_type[:3]    # "PRA", "RAC", "OFF", "QUA" …
-        return f"{date_part} {time_part}  {stype}  │  {track_s}  │  {car_s}"
+        prefix = {"memory": "[MEM] ", "external": "[EXT] "}.get(self.source, "")
+        return f"{prefix}{date_part} {time_part}  {stype}  │  {track_s}  │  {car_s}"
 
 
 # ──────────────────────────────────────────────
@@ -236,6 +236,51 @@ def load_folder(folder_path: str) -> list:
     return result
 
 
+def _session_from_parsed(parsed, source: str = "memory") -> SessionData:
+    """
+    Converts a parsed iracing-laps SessionData (from parse_ibt) into a
+    GUI SessionData object, so in-memory IBT sessions can be displayed
+    alongside CSV-loaded sessions without writing anything to disk.
+    """
+    laps = []
+    for lap in parsed.laps:
+        lt_sec = lap.lap_time if (lap.lap_time and lap.lap_time > 0) else None
+        laps.append(LapRow(
+            lap_num      = lap.lap_num,
+            lap_time_str = lap.lap_time_str(),
+            lap_time_sec = lt_sec,
+            offtracks    = lap.offtracks,
+            in_pit       = lap.on_pit_road,
+            sector_times = list(lap.sector_times),
+        ))
+
+    valid_times = [l.lap_time_sec for l in laps
+                   if l.lap_time_sec is not None and not l.in_pit]
+    best_sec = min(valid_times) if valid_times else None
+    best_idx = next(
+        (i for i, l in enumerate(laps)
+         if l.lap_time_sec == best_sec and not l.in_pit),
+        None
+    ) if best_sec is not None else None
+
+    clean = [l for l in laps if is_clean_lap(l, best_sec)] if best_sec else []
+    avg   = (sum(l.lap_time_sec for l in clean) / len(clean)) if clean else None
+
+    return SessionData(
+        csv_file      = parsed.filename,
+        date          = parsed.date,
+        car           = parsed.car,
+        track         = parsed.track,
+        session_type  = parsed.session_type,
+        laps          = laps,
+        best_lap_sec  = best_sec,
+        best_lap_idx  = best_idx,
+        clean_laps    = clean,
+        avg_clean_sec = avg,
+        source        = source,
+    )
+
+
 # ──────────────────────────────────────────────
 # UI helpers
 # ──────────────────────────────────────────────
@@ -296,108 +341,153 @@ def make_session_listbox(parent, selectmode=tk.SINGLE):
     return frame, listbox
 
 
-# ──────────────────────────────────────────────
-# Track map helpers
-# ──────────────────────────────────────────────
-
-def track_to_filename(track: str) -> str:
-    """Normalises a track name to a safe PNG filename. e.g. 'Autodromo Nazionale Monza Combined' → 'autodromo-nazionale-monza-combined.png'"""
-    import unicodedata
-    s = unicodedata.normalize("NFKD", track).encode("ascii", "ignore").decode()
-    s = re.sub(r"[^\w\s-]", "", s).strip().lower()
-    s = re.sub(r"[\s_]+", "-", s)
-    s = re.sub(r"-+", "-", s)
-    return s + ".png"
-
-
-def _trackmaps_dir() -> Path:
-    """Returns the trackmaps/ folder next to this script."""
-    return Path(__file__).parent / "trackmaps"
-
 
 # ──────────────────────────────────────────────
 # Tab 1 — Table
 # ──────────────────────────────────────────────
+
+# Colour constants for delta / sector highlighting
+_COL_BETTER   = "#44cc44"   # faster than previous
+_COL_WARN_LOW = "#f0c040"   # 1–250 ms slower
+_COL_WARN_MID = "#f07030"   # 251–499 ms slower
+_COL_WARN_HI  = "#dd2222"   # ≥ 500 ms slower
+_COL_BEST_FG  = "#b44fdb"   # best lap foreground (purple)
+_COL_PIT_FG   = "#888888"   # pit lap foreground (grey)
+_COL_BEST_BG  = "#2a0f3a"   # best lap row background (dark purple tint)
+_COL_PIT_BG   = "#252525"   # pit lap row background
+
+
+def _delta_color(diff: float) -> str | None:
+    """Returns a foreground colour for a time delta (seconds), or None if no colour."""
+    if diff < -0.0005:
+        return _COL_BETTER
+    if diff <= 0.0005:
+        return None        # essentially equal
+    if diff <= 0.250:
+        return _COL_WARN_LOW
+    if diff < 0.500:
+        return _COL_WARN_MID
+    return _COL_WARN_HI
+
+
+def _make_sheet(parent) -> TkSheet:
+    """
+    Creates and returns a configured TkSheet instance with our dark theme.
+    The sheet is read-only (only copy binding enabled).
+    """
+    sheet = TkSheet(
+        parent,
+        theme="dark blue",
+        show_row_index=False,
+        show_top_left=False,
+        default_column_width=80,
+        default_header_height=28,
+        default_row_height=24,
+        font=("", 10, "normal"),
+        header_font=("", 10, "bold"),
+    )
+    # Match the app background colours more closely
+    sheet.change_theme("dark blue")
+    sheet.set_options(
+        table_bg="#2b2b2b",
+        table_fg="white",
+        table_grid_fg="#3d3d3d",
+        header_bg="#3a3a3a",
+        header_fg="white",
+        header_grid_fg="#4d4d4d",
+        table_selected_cells_bg="#1f538d",
+        table_selected_cells_fg="white",
+        vertical_scroll_background="#2b2b2b",
+        horizontal_scroll_background="#2b2b2b",
+    )
+    sheet.enable_bindings("copy")
+    return sheet
+
 
 class TableTab:
     def __init__(self, parent):
         self.sessions: list = []
         self._build(parent)
 
+    # ── Build ──
+
     def _build(self, parent):
-        # ── Horizontal PanedWindow: left (sessions) │ right (table + map) ──
-        h_pane = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
-                                sashwidth=5, sashrelief=tk.FLAT,
-                                bg="#3d3d3d", bd=0)
-        h_pane.pack(fill=tk.BOTH, expand=True)
+        outer = tk.Frame(parent, bg="#1e1e1e")
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        # ── Left panel — session list ──
-        left = ctk.CTkFrame(h_pane, corner_radius=6)
-        h_pane.add(left, minsize=150, width=270)
+        # ── Sessions band (top) — two listboxes side by side ──
+        band = tk.Frame(outer, bg="#1e1e1e")
+        band.pack(fill=tk.X, padx=4, pady=(4, 2))
 
-        ctk.CTkLabel(left, text="Sessions", font=ctk.CTkFont(size=13, weight="bold")
-                     ).pack(anchor="w", padx=10, pady=(8, 4))
-
-        lb_frame, self._session_lb = make_session_listbox(left, selectmode=tk.SINGLE)
-        lb_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        # Left: own + memory sessions
+        left_band = ctk.CTkFrame(band, corner_radius=4)
+        left_band.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        ctk.CTkLabel(left_band, text="Sessions",
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).pack(anchor="w", padx=8, pady=(4, 2))
+        lb_frame, self._session_lb = make_session_listbox(left_band, selectmode=tk.SINGLE)
+        self._session_lb.configure(height=3)
+        lb_frame.pack(fill=tk.X, padx=6, pady=(0, 4))
         self._session_lb.bind("<<ListboxSelect>>", self._on_session_select)
 
-        # ── Right panel — vertical PanedWindow: table (top) │ track map (bottom) ──
-        right = ctk.CTkFrame(h_pane, corner_radius=6)
-        h_pane.add(right, minsize=400)
+        # Right: external sessions
+        right_band = ctk.CTkFrame(band, corner_radius=4)
+        right_band.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 0))
+        ctk.CTkLabel(right_band, text="External",
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).pack(anchor="w", padx=8, pady=(4, 2))
+        ext_lb_frame, self._ext_lb = make_session_listbox(right_band, selectmode=tk.SINGLE)
+        self._ext_lb.configure(height=3)
+        ext_lb_frame.pack(fill=tk.X, padx=6, pady=(0, 4))
+        self._ext_lb.bind("<<ListboxSelect>>", self._on_ext_select)
 
-        v_pane = tk.PanedWindow(right, orient=tk.VERTICAL,
+        # ── Two-panel area: own | external ──
+        h_pane = tk.PanedWindow(outer, orient=tk.HORIZONTAL,
                                 sashwidth=5, sashrelief=tk.FLAT,
                                 bg="#3d3d3d", bd=0)
-        v_pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        h_pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-        # Table frame (top)
-        table_outer = tk.Frame(v_pane, bg="#2b2b2b")
-        v_pane.add(table_outer, minsize=120)
+        # Own panel
+        own_pane = tk.Frame(h_pane, bg="#1e1e1e")
+        h_pane.add(own_pane, minsize=300)
+        self._sheet, self._stat_best, self._stat_avg, self._stat_laps, self._stat_offt = \
+            self._build_table_panel(own_pane, label="My Session")
+        self._current_nsectors = -1      # force column rebuild on first populate
 
-        # Treeview — inside table_outer
-        tree_frame = tk.Frame(table_outer, bg="#2b2b2b")
-        tree_frame.pack(fill=tk.BOTH, expand=True)
+        # External panel
+        ext_pane = tk.Frame(h_pane, bg="#1e1e1e")
+        h_pane.add(ext_pane, minsize=300)
+        self._sheet_ext, self._stat_best_ext, self._stat_avg_ext, \
+            self._stat_laps_ext, self._stat_offt_ext = \
+            self._build_table_panel(ext_pane, label="External Session")
+        self._current_nsectors_ext = -1
 
-        # Initial columns (no sectors yet — rebuilt dynamically on session select)
-        columns = ("num", "lap", "time", "offtrack", "pit", "_spacer")  # temporary; rebuilt by _apply_tree_columns
-        self._tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
-                                   selectmode="browse")
-        self._tree_frame    = tree_frame   # kept for vsb re-packing if needed
-        self._current_nsectors = 0         # track how many sector columns are active
+    def _build_table_panel(self, parent, label: str):
+        """
+        Builds one table panel (tksheet + stats bar) inside parent.
+        Returns (sheet, stat_best, stat_avg, stat_laps, stat_offt).
+        """
+        # Header label
+        ctk.CTkLabel(parent, text=label,
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#aaaaaa"
+                     ).pack(anchor="w", padx=6, pady=(4, 2))
 
-        self._apply_tree_columns(0)        # build with 0 sectors
+        # tksheet
+        sheet = _make_sheet(parent)
+        sheet.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 2))
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
-        self._tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._tree.tag_configure("best", foreground="#f0c040",
-                                  font=("", 10, "bold"))
-        self._tree.tag_configure("pit",  foreground="#888888")
-
-        # Stats bar (still inside table_outer, below the treeview)
-        stats = tk.Frame(table_outer, bg="#1e1e2e", height=48)
+        # Stats bar
+        stats = tk.Frame(parent, bg="#1e1e2e", height=48)
         stats.pack(fill=tk.X, side=tk.BOTTOM)
         stats.pack_propagate(False)
 
-        self._stat_best  = self._stat_pair(stats, "Best lap")
-        self._stat_avg   = self._stat_pair(stats, "Avg clean")
-        self._stat_laps  = self._stat_pair(stats, "Total laps")
-        self._stat_offt  = self._stat_pair(stats, "Off-tracks")
+        stat_best = self._stat_pair(stats, "Best lap")
+        stat_avg  = self._stat_pair(stats, "Avg clean")
+        stat_laps = self._stat_pair(stats, "Total laps")
+        stat_offt = self._stat_pair(stats, "Off-tracks")
 
-        # ── Track map panel (bottom of vertical pane) ──
-        map_outer = tk.Frame(v_pane, bg="#1a1a2e")
-        v_pane.add(map_outer, minsize=80, height=200)
-
-        self._map_canvas = tk.Canvas(map_outer, bg="#1a1a2e",
-                                     highlightthickness=0)
-        self._map_canvas.pack(fill=tk.BOTH, expand=True)
-        self._map_canvas.bind("<Configure>", self._on_map_resize)
-
-        self._map_track  = None   # current track name
-        self._map_image  = None   # PhotoImage reference (prevent GC)
+        return sheet, stat_best, stat_avg, stat_laps, stat_offt
 
     def _stat_pair(self, parent, label: str):
         """Creates a label+value pair in the stats bar, returns the value label."""
@@ -410,61 +500,51 @@ class TableTab:
         val.pack(anchor="w")
         return val
 
-    def _apply_tree_columns(self, num_sectors: int) -> None:
-        """
-        Rebuilds Treeview column definitions to include num_sectors sector columns.
-        Column order: # | Lap | S1..SN | Time | Off-track | Pit | (spacer)
-        Called once at build time (0 sectors) and again when a session with a different
-        sector count is selected.
-        """
-        sector_cols = tuple(f"s{i+1}" for i in range(num_sectors))
-        # Sectors sit between Lap and Time
-        columns = ("num", "lap") + sector_cols + ("time", "offtrack", "pit", "_spacer")
-        self._tree.configure(columns=columns)
+    # ── Column setup ──
 
-        # Fixed column definitions
-        self._tree.heading("num",      text="#")
-        self._tree.column ("num",      width=38,  anchor="center", stretch=False, minwidth=38)
-        self._tree.heading("lap",      text="Lap")
-        self._tree.column ("lap",      width=55,  anchor="center", stretch=False, minwidth=55)
+    @staticmethod
+    def _build_headers(num_sectors: int) -> list:
+        """Returns the list of column header strings for a given sector count."""
+        return (["#", "Lap"]
+                + [f"S{i+1}" for i in range(num_sectors)]
+                + ["Time", "Delta", "Off-track", "Pit"])
 
-        for i in range(num_sectors):
-            col = f"s{i+1}"
-            self._tree.heading(col, text=f"S{i+1}")
-            self._tree.column(col, width=75, anchor="center", stretch=False, minwidth=60)
-
-        self._tree.heading("time",     text="Time")
-        self._tree.column ("time",     width=105, anchor="center", stretch=False, minwidth=105)
-        self._tree.heading("offtrack", text="Off-track")
-        self._tree.column ("offtrack", width=80,  anchor="center", stretch=False, minwidth=80)
-        self._tree.heading("pit",      text="Pit")
-        self._tree.column ("pit",      width=48,  anchor="center", stretch=False, minwidth=48)
-
-        self._tree.heading("_spacer", text="")
-        self._tree.column("_spacer", width=1, anchor="center", stretch=True, minwidth=1)
-
-        self._current_nsectors = num_sectors
-
-        # Re-register tag styles (reset on column rebuild)
-        self._tree.tag_configure("best", foreground="#f0c040", font=("", 10, "bold"))
-        self._tree.tag_configure("pit",  foreground="#888888")
+    @staticmethod
+    def _col_widths(num_sectors: int) -> list:
+        """Returns a list of column widths matching _build_headers order."""
+        return ([38, 55]
+                + [75] * num_sectors
+                + [105, 80, 80, 48])
 
     # ── Data update ──
 
     def update_sessions(self, sessions: list) -> None:
         self.sessions = sessions
+        own = [s for s in sessions if s.source in ("own", "memory")]
+        ext = [s for s in sessions if s.source == "external"]
+
         self._session_lb.delete(0, tk.END)
-        for s in sessions:
+        for s in own:
             self._session_lb.insert(tk.END, s.label())
-        self._clear_table()
-        self._clear_stats()
 
-    def _clear_table(self):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
+        self._ext_lb.delete(0, tk.END)
+        for s in ext:
+            self._ext_lb.insert(tk.END, s.label())
 
-    def _clear_stats(self):
-        for lbl in (self._stat_best, self._stat_avg, self._stat_laps, self._stat_offt):
+        self._clear_sheet(self._sheet)
+        self._clear_sheet(self._sheet_ext)
+        self._clear_stats(self._stat_best, self._stat_avg,
+                          self._stat_laps, self._stat_offt)
+        self._clear_stats(self._stat_best_ext, self._stat_avg_ext,
+                          self._stat_laps_ext, self._stat_offt_ext)
+
+    @staticmethod
+    def _clear_sheet(sheet: TkSheet) -> None:
+        sheet.set_sheet_data([], reset_col_positions=True, reset_highlights=True)
+
+    @staticmethod
+    def _clear_stats(*stat_labels) -> None:
+        for lbl in stat_labels:
             lbl.config(text="—")
 
     # ── Event handlers ──
@@ -473,101 +553,146 @@ class TableTab:
         sel = self._session_lb.curselection()
         if not sel:
             return
-        session = self.sessions[sel[0]]
-        self._populate_table(session)
-        self._populate_stats(session)
+        self._ext_lb.selection_clear(0, tk.END)
+        own = [s for s in self.sessions if s.source in ("own", "memory")]
+        if sel[0] >= len(own):
+            return
+        session = own[sel[0]]
+        self._populate_table(session, self._sheet, "_current_nsectors")
+        self._populate_stats(session,
+                             self._stat_best, self._stat_avg,
+                             self._stat_laps, self._stat_offt)
 
-    def _populate_table(self, session: SessionData):
-        self._clear_table()
+    def _on_ext_select(self, _event=None):
+        sel = self._ext_lb.curselection()
+        if not sel:
+            return
+        self._session_lb.selection_clear(0, tk.END)
+        ext = [s for s in self.sessions if s.source == "external"]
+        if sel[0] >= len(ext):
+            return
+        session = ext[sel[0]]
+        self._populate_table(session, self._sheet_ext, "_current_nsectors_ext")
+        self._populate_stats(session,
+                             self._stat_best_ext, self._stat_avg_ext,
+                             self._stat_laps_ext, self._stat_offt_ext)
 
-        # Determine sector count for this session
+    # ── Table population ──
+
+    def _populate_table(self, session: SessionData,
+                        sheet: TkSheet, nsectors_attr: str) -> None:
+        """
+        Fills `sheet` with data from `session`.
+        nsectors_attr: name of the instance attribute tracking current sector count
+        for this specific sheet (e.g. "_current_nsectors" or "_current_nsectors_ext").
+        """
         num_sectors = max((len(l.sector_times) for l in session.laps), default=0)
-        if num_sectors != self._current_nsectors:
-            self._apply_tree_columns(num_sectors)
+
+        # Rebuild headers/widths if sector count changed
+        current_ns = getattr(self, nsectors_attr)
+        if num_sectors != current_ns:
+            headers = self._build_headers(num_sectors)
+            widths  = self._col_widths(num_sectors)
+            sheet.headers(headers)
+            sheet.set_column_widths(widths)
+            setattr(self, nsectors_attr, num_sectors)
+
+        # Build table data
+        data = []
+        prev_sec        = None
+        prev_sectors    = None   # list[Optional[float]] from previous lap
 
         for i, lap in enumerate(session.laps):
             pit_str = "Yes" if lap.in_pit else ""
 
-            # Sector time display values
+            # Sector display values (just the formatted time, colour applied separately)
             sector_vals = []
             for si in range(num_sectors):
-                if len(lap.sector_times) > si and lap.sector_times[si] is not None:
-                    sector_vals.append(format_seconds(lap.sector_times[si]))
-                else:
-                    sector_vals.append("")
+                cur = lap.sector_times[si] if si < len(lap.sector_times) else None
+                sector_vals.append(format_seconds(cur) if cur is not None else "")
 
-            if i == session.best_lap_idx:
-                tag = "best"
-            elif lap.in_pit:
-                tag = "pit"
-            else:
-                tag = ""
+            # Delta vs previous lap
+            delta_str = ""
+            if prev_sec is not None and lap.lap_time_sec is not None:
+                diff = lap.lap_time_sec - prev_sec
+                if diff < -0.0005:
+                    delta_str = "−" + format_seconds(abs(diff))
+                elif diff > 0.0005:
+                    delta_str = "+" + format_seconds(diff)
 
-            self._tree.insert("", tk.END,
-                values=(i + 1, lap.lap_num, *sector_vals,
-                        lap.lap_time_str, lap.offtracks, pit_str, ""),
-                tags=(tag,) if tag else ())
+            if lap.lap_time_sec is not None:
+                prev_sec = lap.lap_time_sec
 
-    def _populate_stats(self, session: SessionData):
+            row = ([i + 1, lap.lap_num]
+                   + sector_vals
+                   + [lap.lap_time_str, delta_str, lap.offtracks, pit_str])
+            data.append(row)
+
+        # Load data (reset highlights too)
+        sheet.set_sheet_data(data, reset_col_positions=False, reset_highlights=True)
+
+        # ── Apply colours ──
+        # Column indices: 0=#, 1=Lap, 2..2+ns-1=sectors, 2+ns=Time, 2+ns+1=Delta
+        sector_start = 2
+        delta_col    = sector_start + num_sectors + 1   # after Time
+
+        prev_sec     = None
+        prev_sectors = None
+
+        for i, lap in enumerate(session.laps):
+            is_best = (i == session.best_lap_idx)
+            is_pit  = lap.in_pit
+
+            # Row-level background/foreground for best/pit
+            if is_best:
+                sheet.highlight_rows(
+                    rows=[i], bg=_COL_BEST_BG, fg=_COL_BEST_FG,
+                    redraw=False, overwrite=True)
+            elif is_pit:
+                sheet.highlight_rows(
+                    rows=[i], bg=_COL_PIT_BG, fg=_COL_PIT_FG,
+                    redraw=False, overwrite=True)
+
+            # Delta cell colour (only if there's a valid value and not best/pit)
+            if not is_best and not is_pit and prev_sec is not None and lap.lap_time_sec is not None:
+                diff  = lap.lap_time_sec - prev_sec
+                col_fg = _delta_color(diff)
+                if col_fg:
+                    sheet.highlight_cells(
+                        row=i, column=delta_col,
+                        fg=col_fg, redraw=False, overwrite=True)
+
+            # Sector cell colours (individual per cell, even on best/pit rows)
+            if prev_sectors is not None:
+                for si in range(num_sectors):
+                    cur  = lap.sector_times[si]  if si < len(lap.sector_times)  else None
+                    prev = prev_sectors[si]       if si < len(prev_sectors)      else None
+                    if cur is not None and prev is not None:
+                        diff   = cur - prev
+                        col_fg = _delta_color(diff)
+                        if col_fg:
+                            sheet.highlight_cells(
+                                row=i, column=sector_start + si,
+                                fg=col_fg, redraw=False, overwrite=True)
+
+            # Advance prev state
+            if lap.lap_time_sec is not None:
+                prev_sec = lap.lap_time_sec
+            if lap.sector_times:
+                prev_sectors = lap.sector_times
+
+        sheet.redraw()
+
+    def _populate_stats(self, session: SessionData,
+                        stat_best, stat_avg, stat_laps, stat_offt) -> None:
         best_str   = format_seconds(session.best_lap_sec) if session.best_lap_sec else "—"
         avg_str    = format_seconds(session.avg_clean_sec) if session.avg_clean_sec else "—"
         total_offt = sum(l.offtracks for l in session.laps)
 
-        self._stat_best.config(text=best_str)
-        self._stat_avg.config(text=avg_str)
-        self._stat_laps.config(text=str(len(session.laps)))
-        self._stat_offt.config(text=str(total_offt))
-
-        self._load_track_map(session.track)
-
-    # ── Track map ──
-
-    def _load_track_map(self, track: str):
-        """Loads and displays the track map PNG, or shows track name as fallback."""
-        self._map_track = track
-        self._render_map()
-
-    def _render_map(self):
-        """Renders the current track map (or fallback text) onto the canvas."""
-        canvas = self._map_canvas
-        canvas.delete("all")
-        w = canvas.winfo_width()
-        h = canvas.winfo_height()
-        if w < 10 or h < 10:
-            return
-
-        if _PIL_AVAILABLE and self._map_track:
-            img_path = _trackmaps_dir() / track_to_filename(self._map_track)
-            if img_path.exists():
-                try:
-                    img = Image.open(img_path).convert("RGBA")
-                    # Scale to fit canvas keeping aspect ratio
-                    img_w, img_h = img.size
-                    scale = min(w / img_w, h / img_h) * 0.92
-                    new_w = max(1, int(img_w * scale))
-                    new_h = max(1, int(img_h * scale))
-                    img = img.resize((new_w, new_h), Image.LANCZOS)
-                    self._map_image = ImageTk.PhotoImage(img)
-                    canvas.create_image(w // 2, h // 2,
-                                        anchor=tk.CENTER,
-                                        image=self._map_image)
-                    return
-                except Exception:
-                    pass
-
-        # Fallback: track name + expected filename centred
-        name = self._map_track or ""
-        expected = track_to_filename(name) if name else ""
-        lines = name
-        if expected:
-            lines = f"{name}\n\ntrackmaps/{expected}"
-        canvas.create_text(w // 2, h // 2, text=lines,
-                           fill="#555555", font=("", 12, "italic"),
-                           justify=tk.CENTER, width=w - 20)
-
-    def _on_map_resize(self, _event=None):
-        """Re-renders the map when the canvas is resized."""
-        self._render_map()
+        stat_best.config(text=best_str)
+        stat_avg.config(text=avg_str)
+        stat_laps.config(text=str(len(session.laps)))
+        stat_offt.config(text=str(total_offt))
 
 
 # ──────────────────────────────────────────────
@@ -595,39 +720,54 @@ class ChartsTab:
         self._build(parent)
 
     def _build(self, parent):
-        # ── Horizontal PanedWindow: left (controls) │ right (chart) ──
-        h_pane = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
-                                sashwidth=5, sashrelief=tk.FLAT,
-                                bg="#3d3d3d", bd=0)
-        h_pane.pack(fill=tk.BOTH, expand=True)
+        outer = tk.Frame(parent, bg="#1e1e1e")
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        # ── Left panel — controls ──
-        left = ctk.CTkFrame(h_pane, corner_radius=6)
-        h_pane.add(left, minsize=150, width=270)
+        # ── Sessions band (top) — single unified listbox (own + external) ──
+        band = tk.Frame(outer, bg="#1e1e1e")
+        band.pack(fill=tk.X, padx=4, pady=(4, 2))
 
-        ctk.CTkLabel(left, text="Sessions (multi-select)",
-                     font=ctk.CTkFont(size=13, weight="bold")
-                     ).pack(anchor="w", padx=10, pady=(8, 4))
+        sessions_frame = ctk.CTkFrame(band, corner_radius=4)
+        sessions_frame.pack(fill=tk.BOTH, expand=True)
 
-        lb_frame, self._session_lb = make_session_listbox(left, selectmode=tk.EXTENDED)
-        lb_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 8))
+        # Header row: label + Select All button
+        hdr = ctk.CTkFrame(sessions_frame, fg_color="transparent")
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 2))
+        ctk.CTkLabel(hdr, text="Sessions  (Ctrl+Click or Shift+Click to multi-select)",
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).pack(side=tk.LEFT)
+        ctk.CTkButton(hdr, text="Select All", width=90, height=22,
+                      font=ctk.CTkFont(size=11),
+                      command=lambda: self._session_lb.select_set(0, tk.END)
+                      ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        ctk.CTkLabel(left, text="Chart type",
-                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10)
+        # Single listbox — all sessions together (own labels plain, external with [EXT] prefix)
+        lb_frame, self._session_lb = make_session_listbox(sessions_frame, selectmode=tk.EXTENDED)
+        self._session_lb.configure(height=4)
+        lb_frame.pack(fill=tk.X, padx=6, pady=(0, 4))
+
+        # ── Bottom area: controls row + matplotlib canvas ──
+        bottom = tk.Frame(outer, bg="#1e1e1e")
+        bottom.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        # Controls row (chart type selector + Plot button)
+        ctrl_row = ctk.CTkFrame(bottom, corner_radius=4)
+        ctrl_row.pack(fill=tk.X, pady=(0, 4))
+
+        ctk.CTkLabel(ctrl_row, text="Chart type",
+                     font=ctk.CTkFont(size=11)).pack(side=tk.LEFT, padx=(10, 6), pady=6)
         self._chart_var = ctk.StringVar(value=CHART_TYPES[0])
-        ctk.CTkComboBox(left, variable=self._chart_var, values=CHART_TYPES,
-                        state="readonly", width=248
-                        ).pack(padx=10, pady=(4, 10))
+        ctk.CTkComboBox(ctrl_row, variable=self._chart_var, values=CHART_TYPES,
+                        state="readonly", width=220
+                        ).pack(side=tk.LEFT, padx=(0, 10), pady=6)
+        ctk.CTkButton(ctrl_row, text="Plot", command=self._plot,
+                      font=ctk.CTkFont(size=13, weight="bold"), height=32, width=80
+                      ).pack(side=tk.LEFT, pady=6)
 
-        ctk.CTkButton(left, text="Plot", command=self._plot,
-                      font=ctk.CTkFont(size=13, weight="bold"), height=36
-                      ).pack(padx=10, pady=(0, 10), fill=tk.X)
-
-        # ── Right panel — matplotlib canvas ──
-        right = ctk.CTkFrame(h_pane, corner_radius=6)
-        h_pane.add(right, minsize=400)
-
-        self._embed_matplotlib(right)
+        # Matplotlib canvas (fills remaining space)
+        canvas_frame = ctk.CTkFrame(bottom, corner_radius=4)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self._embed_matplotlib(canvas_frame)
 
     def _embed_matplotlib(self, parent):
         self._fig = plt.figure(figsize=(9, 6), dpi=100)
@@ -650,14 +790,14 @@ class ChartsTab:
     def update_sessions(self, sessions: list) -> None:
         self.sessions = sessions
         self._session_lb.delete(0, tk.END)
-        for s in sessions:
+        for s in sessions:   # all sessions together — own (plain) + external ([EXT] prefix)
             self._session_lb.insert(tk.END, s.label())
 
     # ── Plot dispatcher ──
 
     def _get_selected_sessions(self) -> list:
-        indices = self._session_lb.curselection()
-        return [self.sessions[i] for i in indices]
+        return [self.sessions[i] for i in self._session_lb.curselection()
+                if i < len(self.sessions)]
 
     def _plot(self):
         self._hover_annot = None   # clf() destroys all artists; reset reference
@@ -860,8 +1000,8 @@ class App(ctk.CTk):
         configure_treeview_style()
 
         self.sessions: list = []
-        self._ibt_var        = ctk.StringVar()
-        self._out_var        = ctk.StringVar()
+        self._ibt_path: str  = ""
+        self._out_path: str  = str(Path.home() / "Documents" / "iRacing-Lap-Analysis")
         self._only_complete  = ctk.BooleanVar(value=True)
         self._processing     = False
         self._queue: queue.Queue = queue.Queue()
@@ -870,60 +1010,118 @@ class App(ctk.CTk):
         self._build_tabs()
 
     # ────────────────────────────────────────
-    # Top bar  (two rows)
+    # Top bar
     # ────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_path(path: str) -> str:
+        """Returns a display-friendly version of a path (home dir collapsed)."""
+        if not path:
+            return ""
+        try:
+            return "📁 " + str(Path(path).relative_to(Path.home()).__str__().replace("\\", "/"))
+        except ValueError:
+            return "📁 " + path
+
+    def _set_path_label(self, lbl: ctk.CTkLabel, path: str, placeholder: str = "") -> None:
+        """Updates a path label; shows placeholder text if path is empty."""
+        if path:
+            lbl.configure(text=self._fmt_path(path), text_color="#aaaaaa")
+        else:
+            lbl.configure(text=placeholder, text_color="#555555")
 
     def _build_top_bar(self):
         outer = ctk.CTkFrame(self, corner_radius=6)
         outer.pack(fill=tk.X, padx=10, pady=(10, 4))
 
-        # ── Row 1: telemetry folder (.ibt) ──
-        row1 = ctk.CTkFrame(outer, fg_color="transparent")
-        row1.pack(fill=tk.X, padx=10, pady=(8, 2))
+        # ── Two-column panel: left = mine, right = external ──
+        cols = ctk.CTkFrame(outer, fg_color="transparent")
+        cols.pack(fill=tk.X, padx=10, pady=(8, 4))
+        cols.columnconfigure(0, weight=1, uniform="col")
+        cols.columnconfigure(1, weight=1, uniform="col")
 
-        ctk.CTkLabel(row1, text="Telemetry folder (.ibt):",
-                     width=170, anchor="w").pack(side=tk.LEFT)
-        ctk.CTkEntry(row1, textvariable=self._ibt_var, width=400,
-                     placeholder_text="Folder with .ibt files…"
-                     ).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(row1, text="Browse", width=80,
-                      command=self._browse_ibt).pack(side=tk.LEFT)
+        # ── LEFT column — my telemetry + output ──
+        left = ctk.CTkFrame(cols, corner_radius=4)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
-        # ── Row 2: output folder + options + Process ──
-        row2 = ctk.CTkFrame(outer, fg_color="transparent")
-        row2.pack(fill=tk.X, padx=10, pady=(2, 8))
+        ctk.CTkLabel(left, text="My Telemetry",
+                     font=ctk.CTkFont(size=12, weight="bold")
+                     ).pack(anchor="w", padx=10, pady=(8, 4))
 
-        ctk.CTkLabel(row2, text="Output folder (CSVs):",
-                     width=170, anchor="w").pack(side=tk.LEFT)
-        ctk.CTkEntry(row2, textvariable=self._out_var, width=400,
-                     placeholder_text="Folder to save CSVs…"
-                     ).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(row2, text="Browse", width=80,
-                      command=self._browse_out).pack(side=tk.LEFT, padx=(0, 12))
+        # IBT folder row
+        ibt_row = ctk.CTkFrame(left, fg_color="transparent")
+        ibt_row.pack(fill=tk.X, padx=10, pady=(0, 2))
+        ctk.CTkButton(ibt_row, text="Browse folder", width=120,
+                      command=self._browse_ibt).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(ibt_row, text="Open IBT(s)…", width=120,
+                      command=self._open_ibt_files).pack(side=tk.LEFT)
 
-        ctk.CTkCheckBox(row2, text="Only complete laps",
+        self._ibt_lbl = ctk.CTkLabel(left, text="", text_color="#555555",
+                                     anchor="w", font=ctk.CTkFont(size=11))
+        self._ibt_lbl.pack(fill=tk.X, padx=12, pady=(0, 6))
+        self._set_path_label(self._ibt_lbl, self._ibt_path,
+                             placeholder="No folder selected")
+
+        # Output folder row
+        ctk.CTkLabel(left, text="Output folder (CSVs)",
+                     font=ctk.CTkFont(size=12, weight="bold")
+                     ).pack(anchor="w", padx=10, pady=(4, 4))
+
+        out_row = ctk.CTkFrame(left, fg_color="transparent")
+        out_row.pack(fill=tk.X, padx=10, pady=(0, 2))
+        ctk.CTkButton(out_row, text="Browse folder", width=120,
+                      command=self._browse_out).pack(side=tk.LEFT)
+
+        self._out_lbl = ctk.CTkLabel(left, text="", text_color="#555555",
+                                     anchor="w", font=ctk.CTkFont(size=11))
+        self._out_lbl.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self._set_path_label(self._out_lbl, self._out_path)
+
+        # ── RIGHT column — external IBT (friends/team, in-memory only) ──
+        right = ctk.CTkFrame(cols, corner_radius=4)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        ctk.CTkLabel(right, text="External Telemetry  (in-memory, no CSV saved)",
+                     font=ctk.CTkFont(size=12, weight="bold")
+                     ).pack(anchor="w", padx=10, pady=(8, 4))
+
+        ext_row = ctk.CTkFrame(right, fg_color="transparent")
+        ext_row.pack(fill=tk.X, padx=10, pady=(0, 2))
+        ctk.CTkButton(ext_row, text="Open IBT(s)…", width=120,
+                      command=self._open_ext_files).pack(side=tk.LEFT)
+
+        self._ext_files_lbl = ctk.CTkLabel(right, text="No files loaded",
+                                           text_color="#555555",
+                                           anchor="w", font=ctk.CTkFont(size=11))
+        self._ext_files_lbl.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        # ── Actions row (full width) ──
+        act_row = ctk.CTkFrame(outer, fg_color="transparent")
+        act_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        ctk.CTkCheckBox(act_row, text="Only complete laps",
                         variable=self._only_complete).pack(side=tk.LEFT, padx=(0, 14))
 
         self._process_btn = ctk.CTkButton(
-            row2, text="⚙  Process", width=120,
+            act_row, text="⚙  Process", width=120,
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._start_processing,
         )
         self._process_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        ctk.CTkButton(row2, text="Reload CSVs", width=110,
+        ctk.CTkButton(act_row, text="Reload CSVs", width=110,
                       command=self._reload_csvs).pack(side=tk.LEFT)
 
-        # ── Row 3: progress bar + status ──
-        row3 = ctk.CTkFrame(outer, fg_color="transparent")
-        row3.pack(fill=tk.X, padx=10, pady=(0, 8))
+        # ── Progress row (full width) ──
+        prog_row = ctk.CTkFrame(outer, fg_color="transparent")
+        prog_row.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-        self._progress = ctk.CTkProgressBar(row3, width=340, height=12)
+        self._progress = ctk.CTkProgressBar(prog_row, width=340, height=12)
         self._progress.set(0)
         self._progress.pack(side=tk.LEFT, padx=(0, 12))
 
         self._status_label = ctk.CTkLabel(
-            row3, text="Select a telemetry folder and click Process.",
+            prog_row, text="Select a telemetry folder and click Process.",
             text_color="#aaaaaa", font=ctk.CTkFont(size=11),
         )
         self._status_label.pack(side=tk.LEFT)
@@ -938,29 +1136,48 @@ class App(ctk.CTk):
         self._charts_tab = ChartsTab(tabview.add("  Charts  "))
 
     # ────────────────────────────────────────
-    # Folder pickers
+    # Folder / file pickers
     # ────────────────────────────────────────
 
     def _browse_ibt(self):
         d = filedialog.askdirectory(title="Select telemetry folder (.ibt files)")
         if d:
-            self._ibt_var.set(d)
-            # Auto-fill output folder with same path if empty
-            if not self._out_var.get().strip():
-                self._out_var.set(d)
+            self._ibt_path = d
+            self._set_path_label(self._ibt_lbl, d)
 
     def _browse_out(self):
         d = filedialog.askdirectory(title="Select output folder (CSVs)")
         if d:
-            self._out_var.set(d)
+            self._out_path = d
+            self._set_path_label(self._out_lbl, d)
+
+    def _open_ibt_files(self):
+        """Opens a file picker to select individual .ibt files for in-memory processing (own)."""
+        files = filedialog.askopenfilenames(
+            title="Select .ibt file(s) to open in memory",
+            filetypes=[("iRacing telemetry", "*.ibt"), ("All files", "*.*")],
+        )
+        if not files:
+            return
+        self._start_memory_processing([Path(f) for f in files], source="memory")
+
+    def _open_ext_files(self):
+        """Opens a file picker to select external .ibt files (friends/team) for in-memory processing."""
+        files = filedialog.askopenfilenames(
+            title="Select external .ibt file(s) (friends/team)",
+            filetypes=[("iRacing telemetry", "*.ibt"), ("All files", "*.*")],
+        )
+        if not files:
+            return
+        self._start_memory_processing([Path(f) for f in files], source="external")
 
     # ────────────────────────────────────────
     # Processing (.ibt → CSVs) in background thread
     # ────────────────────────────────────────
 
     def _start_processing(self):
-        ibt_dir = self._ibt_var.get().strip()
-        out_dir = self._out_var.get().strip()
+        ibt_dir = self._ibt_path
+        out_dir = self._out_path
 
         if not ibt_dir:
             messagebox.showwarning("Missing folder",
@@ -1002,7 +1219,7 @@ class App(ctk.CTk):
         self.after(80, self._poll_queue)
 
     def _process_worker(self, laps_mod, files, out_dir):
-        """Runs in background thread. Sends progress updates via self._queue."""
+        """Runs in background thread. Parses .ibt files and exports CSVs."""
         only_complete = self._only_complete.get()
         sessions      = []
         n             = len(files)
@@ -1016,7 +1233,6 @@ class App(ctk.CTk):
             except Exception as e:
                 self._queue.put(("log", f"  ERROR {fpath.name}: {e}"))
 
-        # Filter laps
         def filter_laps(laps):
             if only_complete:
                 return [l for l in laps if l.lap_time and l.lap_time > 0]
@@ -1024,13 +1240,60 @@ class App(ctk.CTk):
 
         laps_map = {s.filename: filter_laps(s.laps) for s in sessions}
 
-        # Export CSVs
         try:
             laps_mod.export_csv_split(sessions, Path(out_dir), laps_map=laps_map)
         except Exception as e:
             self._queue.put(("log", f"  CSV export error: {e}"))
 
         self._queue.put(("done", len(sessions), sum(len(filter_laps(s.laps)) for s in sessions)))
+
+    # ────────────────────────────────────────
+    # In-memory processing (no CSV written)
+    # ────────────────────────────────────────
+
+    def _start_memory_processing(self, files: list, source: str):
+        """Launches background processing of .ibt files in memory (no CSV export)."""
+        laps_mod = _import_iracing_laps()
+        if laps_mod is None:
+            messagebox.showerror(
+                "iracing-laps.py not found",
+                "iracing-laps.py must be in the same folder as iracing-gui.py.",
+            )
+            return
+
+        self._processing = True
+        self._process_btn.configure(state="disabled")
+        self._progress.set(0)
+        self._set_status(f"Loading {len(files)} file(s) in memory…")
+
+        threading.Thread(
+            target=self._process_worker_memory,
+            args=(laps_mod, files, source),
+            daemon=True,
+        ).start()
+        self.after(80, self._poll_queue)
+
+    def _process_worker_memory(self, laps_mod, files, source: str):
+        """Background worker: parses .ibt files and sends parsed sessions via queue (no CSV)."""
+        only_complete = self._only_complete.get()
+        sessions      = []
+        n             = len(files)
+
+        for idx, fpath in enumerate(files, 1):
+            self._queue.put(("progress", idx, n, fpath.name))
+            try:
+                parsed = laps_mod.parse_ibt(str(fpath))
+                if parsed:
+                    # Filter laps if needed
+                    if only_complete:
+                        parsed.laps = [l for l in parsed.laps
+                                       if l.lap_time and l.lap_time > 0]
+                    if parsed.laps:
+                        sessions.append(_session_from_parsed(parsed, source=source))
+            except Exception as e:
+                self._queue.put(("log", f"  ERROR {fpath.name}: {e}"))
+
+        self._queue.put(("done_memory", sessions))
 
     def _poll_queue(self):
         """Called every 80 ms from the main thread to drain the worker queue."""
@@ -1043,7 +1306,7 @@ class App(ctk.CTk):
                     self._progress.set(idx / total)
                     self._set_status(f"Processing {idx} / {total}  —  {name}")
                 elif kind == "log":
-                    print(msg[1])  # visible in terminal if launched from one
+                    print(msg[1])
                 elif kind == "done":
                     _, n_sessions, n_laps = msg
                     self._progress.set(1.0)
@@ -1055,6 +1318,34 @@ class App(ctk.CTk):
                     )
                     self._reload_csvs()
                     return  # stop polling
+                elif kind == "done_memory":
+                    _, new_sessions = msg
+                    self._progress.set(1.0)
+                    self._processing = False
+                    self._process_btn.configure(state="normal", text="⚙  Process")
+                    if new_sessions:
+                        # Merge: replace any previous sessions of the same source
+                        src = new_sessions[0].source
+                        kept = [s for s in self.sessions if s.source != src]
+                        merged = kept + new_sessions
+                        merged.sort(key=lambda s: s.date, reverse=True)
+                        self._on_folder_loaded(merged)
+                        noun = "session" if len(new_sessions) == 1 else "sessions"
+                        lbl = "[MEM]" if src == "memory" else "[EXT]"
+                        self._set_status(
+                            f"{lbl} {len(new_sessions)} {noun} loaded in memory.",
+                            color="#51b26e",
+                        )
+                        if src == "external":
+                            n = len(new_sessions)
+                            self._ext_files_lbl.configure(
+                                text=f"{n} session(s) loaded",
+                                text_color="#aaaaaa",
+                            )
+                    else:
+                        self._set_status("No valid sessions found in selected files.",
+                                         color="#f07746")
+                    return
         except queue.Empty:
             pass
         if self._processing:
@@ -1065,7 +1356,7 @@ class App(ctk.CTk):
     # ────────────────────────────────────────
 
     def _reload_csvs(self):
-        out_dir = self._out_var.get().strip()
+        out_dir = self._out_path
         if not out_dir:
             self._set_status("No output folder selected.", color="#f07746")
             return
