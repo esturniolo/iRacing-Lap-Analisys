@@ -767,7 +767,7 @@ class ChartsTab:
         best_times = [s.best_lap_sec for s in selected if s.best_lap_sec]
         if best_times:
             overall_best = min(best_times)
-            margin = overall_best * 0.05
+            margin = overall_best * 0.50
             ax.set_ylim(overall_best - margin, overall_best + margin)
 
         ax.set_xlabel("Lap number")
