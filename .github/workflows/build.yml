@@ -65,6 +65,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist\iRacing-Lap-Analyzer.exe
-            dist\iracing-laps.py
+            dist/iRacing-Lap-Analyzer.exe
+            dist/iracing-laps.py
           generate_release_notes: true
